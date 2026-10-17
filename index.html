@@ -957,15 +957,25 @@ App.room=ls.get('otskok.room','');
 App.n=Math.max(1,Math.min(NLEV,parseInt(ls.get('otskok.lastLevel','1'),10)||1));
 
 function api(method,path,body){
-  return fetch(DB_URL+'/'+NS+path+'.json',{method:method,body:body===undefined?undefined:JSON.stringify(body)}).then(function(r){
+  /* таймаут: зависший запрос не должен навсегда блокировать отправку позиции */
+  var ctl=(typeof AbortController!=='undefined')?new AbortController():null,tm=null;
+  var req=fetch(DB_URL+'/'+NS+path+'.json',{method:method,body:body===undefined?undefined:JSON.stringify(body),signal:ctl?ctl.signal:undefined}).then(function(r){
     if(!r.ok)throw new Error('http '+r.status);
     return r.json();
   });
+  var to=new Promise(function(_,rej){tm=setTimeout(function(){try{if(ctl)ctl.abort();}catch(e){}rej(new Error('timeout'));},8000);});
+  return Promise.race([req,to]).then(function(v){clearTimeout(tm);return v;},function(e){clearTimeout(tm);throw e;});
+}
+function errText(){
+  var e=net.err||'';
+  if(/http (401|403)/.test(e))return 'База данных закрыта правилами Firebase (доступ запрещён). Нужно обновить правила в консоли Firebase.';
+  if(/http 404/.test(e))return 'База данных не найдена (проверьте адрес).';
+  return 'Нет связи с рейтингом. Проверьте интернет, игра продолжит работать.';
 }
 function setStatus(){
   var el=$('netStat');
   if(!ON){el.textContent='Автономный режим: результаты хранятся на этом телефоне.';return;}
-  if(!net.ok){el.textContent='Нет связи с рейтингом. Проверьте интернет, игра продолжит работать.';return;}
+  if(!net.ok){el.textContent=errText();return;}
   el.innerHTML='Рейтинг подключён · игроков в рейтинге: <b>'+net.board.length+'</b>';
 }
 function presKey(n){return App.room?('r'+App.room.toLowerCase()+'L'+n):('L'+n);}
@@ -980,8 +990,8 @@ function sendPresence(force){
   var now=performance.now();
   if(net.putBusy||(!force&&now-net.lastPres<200))return;
   net.lastPres=now;net.putBusy=true;
-  api('PUT','rooms/'+App.pkey+'/'+pid,{n:nick,x:Math.round(s.x),y:Math.round(s.y),c:hashStr(pid)%6,k:skin,f:s.done?1:0,a:s.dead>0?0:1,t:Date.now()})
-    .then(function(){net.ok=true;},function(){net.ok=false;})
+  api('PUT','rooms/'+App.pkey+'/'+pid,{n:nick,x:Math.round(s.x),y:Math.round(s.y),c:hashStr(pid)%6,sk:skin,f:s.done?1:0,a:s.dead>0?0:1,t:Date.now()})
+    .then(function(){net.ok=true;net.err='';},function(e){net.ok=false;net.err=String(e&&e.message||e);})
     .then(function(){net.putBusy=false;});
 }
 function pollRoom(){
@@ -1004,11 +1014,11 @@ function pollRoom(){
             var qq=net.q[id]||(net.q[id]=[]);
             if(!qq.length||v.t>qq[qq.length-1].t){qq.push({t:v.t,x:v.x,y:v.y});if(qq.length>14)qq.shift();}
           }}
-        if(now-sn.ts<3500)out.push({peer:id,k:key,n:v.n,x:v.x,y:v.y,c:v.c,k:v.k,f:v.f,a:v.a});
+        if(now-sn.ts<3500)out.push({peer:id,k:key,n:v.n,x:v.x,y:v.y,c:v.c,sk:v.sk,f:v.f,a:v.a});
       }
     }
     net.peers=out;
-  },function(){net.ok=false;}).then(function(){net.pollBusy=false;});
+  },function(e){net.ok=false;net.err=String(e&&e.message||e);}).then(function(){net.pollBusy=false;});
 }
 function refreshBoard(){
   if(!ON)return Promise.resolve();
@@ -1138,7 +1148,7 @@ function showMenu(){
   setStatus();
 }
 function startLevel(n){
-  ensureAudio();leaveRoom();
+  resetInput();ensureAudio();leaveRoom();
   nick=cleanNick($('nick').value)||nick;ls.set('otskok.nick',nick);
   App.n=n;ls.set('otskok.lastLevel',String(n));
   App.pkey=presKey(n);net.peers=[];net.sm={};net.seen={};net.q={};net.off={};
@@ -1157,10 +1167,10 @@ function startLevel(n){
   try{if(navigator.wakeLock)navigator.wakeLock.request('screen').catch(function(){});}catch(e){}
   sendPresence(true);
 }
-function pauseGame(){if(App.state!=='play')return;App.state='pause';show('pause',true);inp.pad=0;$('pad').dataset.dir='0';}
+function pauseGame(){if(App.state!=='play')return;App.state='pause';show('pause',true);resetInput();}
 function resumeGame(){if(App.state!=='pause')return;App.state='play';show('pause',false);}
 function finish(){
-  var s=App.sim,score=calcScore(s),stars=starsFor(s);App.lastScore=score;App.state='result';
+  var s=App.sim,score=calcScore(s),stars=starsFor(s);App.lastScore=score;App.state='result';resetInput();
   SFX.win();vib([30,40,30,40,80]);
   burst(s.x,s.y,40,C.coin,260,1);
   var key='L'+App.n,prev=local.courses[key]||0;
@@ -1275,7 +1285,7 @@ function tick(){
       var ddx=tx-m.x,ddy=ty-m.y;
       if(ddx*ddx+ddy*ddy>360000){m.x=tx;m.y=ty;} /* настоящий респаун/смена уровня */
       else{var kf=Math.min(1,STEP*14);m.x+=ddx*kf;m.y+=ddy*kf;}
-      m.n=cleanNick(p.n)||'Игрок';m.c=(+p.c||0)%6;m.s=(p.k>=0&&p.k<SKINS.length)?(p.k|0):(m.c%SKINS.length);m.f=p.f===1;m.a=p.a!==0;
+      m.n=cleanNick(p.n)||'Игрок';m.c=(+p.c||0)%6;m.s=(p.sk>=0&&p.sk<SKINS.length)?(p.sk|0):(m.c%SKINS.length);m.f=p.f===1;m.a=p.a!==0;
       peerList.push(m);
     }
   }
@@ -1885,6 +1895,11 @@ if(window.PointerEvent){
   var tjEnd=function(e){if(tById(e,tj)){tj=null;jUp();}};
   jb.addEventListener('touchend',tjEnd);jb.addEventListener('touchcancel',tjEnd);
 }
+function resetInput(){padId=null;jId=null;inp.pad=0;inp.jump=false;pad.dataset.dir='0';jb.classList.remove('on');if(typeof tp!=='undefined'){tp=null;tj=null;}}
+/* страховка от залипания: если на экране не осталось касаний — всё отпускаем */
+['touchend','touchcancel'].forEach(function(n){document.addEventListener(n,function(e){if(!e.touches||e.touches.length===0)resetInput();},true);});
+['pointerup','pointercancel'].forEach(function(n){document.addEventListener(n,function(e){if(e.pointerType!=='mouse'&&e.pointerId!==padId&&e.pointerId!==jId)return;if(e.pointerId===padId){padId=null;inp.pad=0;pad.dataset.dir='0';}if(e.pointerId===jId){jId=null;jUp();}},true);});
+window.addEventListener('pagehide',resetInput);
 document.addEventListener('touchmove',function(e){if(App.state==='play'||App.state==='count')e.preventDefault();},{passive:false});
 ['contextmenu','gesturestart','dblclick'].forEach(function(n){document.addEventListener(n,function(e){e.preventDefault();});});
 window.addEventListener('keydown',function(e){
